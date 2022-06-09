@@ -1,0 +1,184 @@
+---
+title: "Generation of signature interpretation matrix"
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+```{r setup, message=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+
+options(java.parameters = "-Xmx8000m")
+library(data.table)
+library(dplyr)
+library(ggpubr)
+library(ggrepel)
+library(sjPlot)
+library(tidyverse)
+library(rstatix)
+library(reshape2)
+library(ggplot2)
+library(ggthemes)
+library(lemon)
+library(RColorBrewer)
+library(coin)
+
+# PATHWAYS
+BASE <- dirname(rstudioapi::getSourceEditorContext()$path)
+INPUT_DIR <- file.path(BASE,"data")
+OUTPUT_DIR <- file.path(BASE,"output")
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# PLOTS THEME
+theme_set(theme_tufte(base_size = 6, base_family = "ArialMT"))
+theme_update(text = element_text(size = 6),
+             axis.text = element_text(size = 6),
+             axis.line = element_line(size = 0.5), 
+             axis.ticks = element_line(size = 0.5),
+             axis.ticks.length = unit(.1, "cm"))
+```
+
+# LOAD DATA
+```{r data}
+#Sample per components matrix
+TCGA_components <- as.data.frame(readRDS(paste0(INPUT_DIR,"/TCGA_SxC_uninfPrior_Input_Matrix.rds")))
+#Normalize matrix
+TCGA_components[,c(1:22)] <- t(apply(TCGA_components[,c(1:22)],1,function(x){x/sum(x)}))
+TCGA_components[,c(23:32)] <- t(apply(TCGA_components[,c(23:32)],1,function(x){x/sum(x)}))
+TCGA_components[,c(33:35)] <- t(apply(TCGA_components[,c(33:35)],1,function(x){x/sum(x)}))
+TCGA_components[,c(36:40)] <- t(apply(TCGA_components[,c(36:40)],1,function(x){x/sum(x)}))
+TCGA_components[,c(41:43)] <- t(apply(TCGA_components[,c(41:43)],1,function(x){x/sum(x)}))
+components <- colnames(TCGA_components)
+
+#CNSig exposure per sample
+TCGA_signatures <- readRDS(paste0(INPUT_DIR,"/Signature_Compendium_v5_Cosine-0.74_Activities_THRESH95_NAMESAPRIL21.rds"))
+
+#CNSig definitions (weights per component)
+CNSig_definitions <- readRDS(paste0(INPUT_DIR,"/Signature_Compendium_v5_Cosine-0.74_Signatures_NAMESAPRIL21.rds"))
+```
+
+# LINEAR CORRELATIONS
+```{r lm}
+CNsigs <- colnames(TCGA_signatures)
+component <- colnames(TCGA_components)
+
+sigs <- reshape2::melt(TCGA_signatures)
+colnames(sigs)<-c("sampleID", "CNSig", "level")
+comps <- reshape2::melt(t(TCGA_components))
+colnames(comps)<-c("component", "sampleID", "value")
+dat <- left_join(sigs,comps, by="sampleID")
+
+#Linear correlation 
+res <- dat[dat$level!=0,] %>% group_by(CNSig,component) %>% do(tidy(lm(level ~ value, data = .)))
+res$beta <- res$term=="value"
+res <- res[res$beta==TRUE,] #remove intercept values
+#Correct pvalues
+res$p.adj <- p.adjust(res$p.value, "BH")
+```
+
+# MIX INFORMATION IN INPUT MATRIX AND ACTIVITY MATRIX
+```{r mix}
+# Denormalize components matrix
+comps <- TCGA_components
+comps[,c(1:22)] <- t(apply(comps[,c(1:22)],1,function(x){x*22}))
+comps[,c(23:32)] <- t(apply(comps[,c(23:32)],1,function(x){x*10}))
+comps[,c(33:35)] <- t(apply(comps[,c(33:35)],1,function(x){x*3}))
+comps[,c(36:40)] <- t(apply(comps[,c(36:40)],1,function(x){x*5}))
+comps[,c(41:43)] <- t(apply(comps[,c(41:43)],1,function(x){x*3}))
+comps <- reshape2::melt(t(comps))
+colnames(comps)<-c("component", "sampleID", "value")
+dat <- left_join(sigs,comps, by="sampleID")
+
+# Multiply component weights and activity level per sample
+dat$strength <- dat$value*dat$level
+
+# Sum strength of each component per signature
+dat <- dat %>% group_by(CNSig,component) %>% summarise(sum=sum(strength))
+dat <- left_join(dat, res, by=c("CNSig", "component"))
+
+# Normalize values to one
+dat[,"sum"] <- apply(dat[,"sum"],2,function(x){x/sum(x)})
+```
+
+# ADD INFORMATION OF SIGNATURE DEFINITIONS MATRIX FOR GENERATING THE INTERPRETATION MATRIX
+```{r interpret}
+defs <- reshape2::melt(t(CNSig_definitions))
+colnames(defs)<-c("component", "CNSig", "weights")
+dat <- left_join(dat, defs, by=c("CNSig", "component"))
+
+# Normalize values to one
+dat[,"weights"] <- apply(dat[,"weights"],2,function(x){x/sum(x)})
+
+# Sum values from both matrices
+dat$allSum <- dat$sum + dat$weights
+```
+
+# PLOT POSITIVELY CORRELATED COMPONENTS 
+```{r plot}
+## Prepare data for plotting
+# 1. Select samples with significant (pvalue<0.05) and positive (beta>0) correlations
+# For CX17, we did not apply the p-value threshold due to limited sample size with activity of this signature
+cx17 <- dat[dat$CNSig=="CX17",]
+cx17$plot <- cx17$estimate>=0
+cx <- dat[dat$CNSig!="CX17",]
+cx$plot <- cx$estimate>=0 & cx$p.adj<0.05
+dat <- rbind(cx, cx17)
+
+# 2. Mask no-significant
+dat$allSum[dat$plot==FALSE]<-0
+
+# 3. Normalize sum per signature & feature
+dt <- list()
+dt <- lapply(CNsigs, function(sig){
+  s <- dat[dat$CNSig==sig,]
+  # s[,"allSum"] <- apply(s[,"allSum"],2,function(x){x/sum(x)})
+  s[c(1:22),"allSum"] <- apply(s[c(1:22),"allSum"],2,function(x){x/sum(x)})
+  s[c(23:32),"allSum"] <- apply(s[c(23:32),"allSum"],2,function(x){x/sum(x)})
+  s[c(33:35),"allSum"] <- apply(s[c(33:35),"allSum"],2,function(x){x/sum(x)})
+  s[c(36:40),"allSum"] <- apply(s[c(36:40),"allSum"],2,function(x){x/sum(x)})
+  s[c(41:43),"allSum"] <- apply(s[c(41:43),"allSum"],2,function(x){x/sum(x)})
+  dt[[sig]]<-s
+})
+names(dt)<-CNsigs
+dt <- do.call(rbind, dt)
+
+
+# 4. Define categories of variables
+dt$component <- factor(dt$component, levels = rev(component))
+dt$CNSig <- factor(dt$CNSig, levels = CNsigs)
+
+# 5. Discretize signature interpretation values
+breaks = c(0, 0.0001, 0.05, 0.1, 0.5, 1)
+# Names of categories
+tags = c("0", ">0%", ">5%", ">10%", ">50%")
+# Split allSum into somewhat meaningful categories
+dt$Disc = cut(dt$allSum, breaks = breaks, include.lowest=TRUE, right=FALSE, labels = tags)
+# Colors
+# blue gradient
+cols = c("0" = "#FFFFFF", ">0%" = "#ece7f2", 
+         ">5%" = "#a6bddb", ">10%"= "#3690c0", 
+         ">50%"= "#045a8d")
+
+# Plot mean of sum of posterior values per component in the group with high activity
+pB = ggplot(dt, aes(y = component, x = CNSig, fill = Disc)) + 
+  geom_tile(aes(width = 0.94, height = 0.94)) + 
+  theme_tufte(base_family = "", base_size = 16) + 
+  theme(legend.position = "bottom", legend.justification = "right", legend.title = element_text(size=12), legend.text = element_text(size=10), 
+        axis.line = element_line(size = 0.5), axis.ticks = element_line(size = 0.5), 
+        axis.ticks.length = unit(.1, "cm"), plot.margin = unit(c(0, 0, 0, 0), "null"), aspect.ratio = 43/17) + 
+  labs(x = "CIN signature", y = "Feature components") + 
+  scale_x_discrete(position = "top", guide = guide_axis(angle = 90)) + labs(fill = "Interpretation values\nBeta > 0\nAdj. p-val < 0.05") +
+  scale_fill_manual(values = cols) + 
+  guides(fill = guide_legend(nrow = 1)) +
+  coord_capped_cart(top = "both", left = "both")
+
+print(pB)
+
+# ## Save output
+# cairo_pdf(file.path(OUTPUT_DIR, "EDF_4_Signature_interpretation_vertical.pdf"), height = 230/25.4, width = 161/25.4)
+# print(pB); dev.off()
+# 
+# ggsave(file.path(OUTPUT_DIR, "EDF_4_Signature_interpretation_vertical.svg"), pB, height = 230/25.4, width = 161/25.4)
+```
